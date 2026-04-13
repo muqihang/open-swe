@@ -38,6 +38,33 @@ from ..utils.sandbox_state import get_sandbox_backend_sync
 logger = logging.getLogger(__name__)
 
 
+def _build_failure_response(
+    *,
+    error: str,
+    status: str,
+    branch_name: str,
+    task_summary: Any | None = None,
+    pr_url: str | None = None,
+    pr_existing: bool | None = None,
+) -> dict[str, Any]:
+    receipt = build_writeback_receipt(
+        branch_name=branch_name,
+        status=status,
+        pr_url=pr_url,
+        pr_existing=pr_existing,
+        task_summary=task_summary,
+    )
+    response: dict[str, Any] = {
+        "success": False,
+        "error": error,
+        "pr_url": pr_url,
+        **receipt,
+    }
+    if pr_existing is not None:
+        response["pr_existing"] = pr_existing
+    return response
+
+
 def commit_and_open_pr(
     title: str,
     body: str,
@@ -122,27 +149,49 @@ def commit_and_open_pr(
         - pr_url: URL of the created PR if successful, otherwise None
         - pr_existing: Whether a PR already existed for this branch
     """
+    config: dict[str, Any] = {}
+    configurable: dict[str, Any] = {}
+    metadata: dict[str, Any] = {}
+    task_summary: Any | None = None
+    target_branch = "open-swe/unknown"
+
     try:
         config = get_config()
         configurable = config.get("configurable", {})
         thread_id = configurable.get("thread_id")
+        metadata = config.get("metadata", {})
+        target_branch = metadata.get("branch_name") or (
+            f"open-swe/{thread_id}" if thread_id else target_branch
+        )
+        task_summary = resolve_task_summary(configurable=configurable)
 
         if not thread_id:
-            return {"success": False, "error": "Missing thread_id in config", "pr_url": None}
+            return _build_failure_response(
+                error="Missing thread_id in config",
+                status="missing_thread_id",
+                branch_name=target_branch,
+                task_summary=task_summary,
+            )
 
         repo_config = configurable.get("repo", {})
         repo_owner = repo_config.get("owner")
         repo_name = repo_config.get("name")
         if not repo_owner or not repo_name:
-            return {
-                "success": False,
-                "error": "Missing repo owner/name in config",
-                "pr_url": None,
-            }
+            return _build_failure_response(
+                error="Missing repo owner/name in config",
+                status="missing_repo_config",
+                branch_name=target_branch,
+                task_summary=task_summary,
+            )
 
         sandbox_backend = get_sandbox_backend_sync(thread_id)
         if not sandbox_backend:
-            return {"success": False, "error": "No sandbox found for thread", "pr_url": None}
+            return _build_failure_response(
+                error="No sandbox found for thread",
+                status="missing_sandbox",
+                branch_name=target_branch,
+                task_summary=task_summary,
+            )
 
         repo_dir = resolve_repo_dir(sandbox_backend, repo_name)
         github_token = get_github_token()
@@ -153,32 +202,24 @@ def commit_and_open_pr(
         git_fetch_origin(sandbox_backend, repo_dir)
         has_unpushed_commits = git_has_unpushed_commits(sandbox_backend, repo_dir)
 
-        metadata = config.get("metadata", {})
         branch_name = metadata.get("branch_name")
-        target_branch = branch_name if branch_name else f"open-swe/{thread_id}"
-        task_summary = resolve_task_summary(configurable=configurable)
         verification_bundle = resolve_verification_bundle(configurable=configurable)
 
         if writeback_blocked_by_verification(verification_bundle):
-            receipt = build_writeback_receipt(
-                branch_name=target_branch,
+            return _build_failure_response(
+                error="Writeback blocked by verification bundle",
                 status="blocked_by_verification",
+                branch_name=target_branch,
                 task_summary=task_summary,
             )
-            return {
-                "success": False,
-                "error": "Writeback blocked by verification bundle",
-                "pr_url": None,
-                **receipt,
-            }
 
         if not (has_uncommitted_changes or has_unpushed_commits):
-            receipt = build_writeback_receipt(
-                branch_name=target_branch,
+            return _build_failure_response(
+                error="No changes detected",
                 status="no_changes_detected",
+                branch_name=target_branch,
                 task_summary=task_summary,
             )
-            return {"success": False, "error": "No changes detected", "pr_url": None, **receipt}
 
         current_branch = git_current_branch(sandbox_backend, repo_dir)
         if current_branch != target_branch:
@@ -186,17 +227,19 @@ def commit_and_open_pr(
                 # Existing branch — plain checkout, do not create or reset
                 result = git_checkout_existing_branch(sandbox_backend, repo_dir, target_branch)
                 if result.exit_code != 0:
-                    return {
-                        "success": False,
-                        "error": f"Failed to checkout branch {target_branch}",
-                        "pr_url": None,
-                    }
+                    return _build_failure_response(
+                        error=f"Failed to checkout branch {target_branch}",
+                        status="git_checkout_failed",
+                        branch_name=target_branch,
+                        task_summary=task_summary,
+                    )
             elif not git_checkout_branch(sandbox_backend, repo_dir, target_branch):
-                return {
-                    "success": False,
-                    "error": f"Failed to checkout branch {target_branch}",
-                    "pr_url": None,
-                }
+                return _build_failure_response(
+                    error=f"Failed to checkout branch {target_branch}",
+                    status="git_checkout_failed",
+                    branch_name=target_branch,
+                    task_summary=task_summary,
+                )
 
         git_config_user(
             sandbox_backend,
@@ -210,45 +253,30 @@ def commit_and_open_pr(
         if has_uncommitted_changes:
             commit_result = git_commit(sandbox_backend, repo_dir, commit_msg)
             if commit_result.exit_code != 0:
-                receipt = build_writeback_receipt(
-                    branch_name=target_branch,
+                return _build_failure_response(
+                    error=f"Git commit failed: {commit_result.output.strip()}",
                     status="git_commit_failed",
+                    branch_name=target_branch,
                     task_summary=task_summary,
                 )
-                return {
-                    "success": False,
-                    "error": f"Git commit failed: {commit_result.output.strip()}",
-                    "pr_url": None,
-                    **receipt,
-                }
 
         installation_token = asyncio.run(get_github_app_installation_token())
         if not installation_token:
-            receipt = build_writeback_receipt(
-                branch_name=target_branch,
+            return _build_failure_response(
+                error="Failed to get GitHub App installation token",
                 status="missing_installation_token",
+                branch_name=target_branch,
                 task_summary=task_summary,
             )
-            return {
-                "success": False,
-                "error": "Failed to get GitHub App installation token",
-                "pr_url": None,
-                **receipt,
-            }
 
         push_result = git_push(sandbox_backend, repo_dir, target_branch)
         if push_result.exit_code != 0:
-            receipt = build_writeback_receipt(
-                branch_name=target_branch,
+            return _build_failure_response(
+                error=f"Git push failed: {push_result.output.strip()}",
                 status="git_push_failed",
+                branch_name=target_branch,
                 task_summary=task_summary,
             )
-            return {
-                "success": False,
-                "error": f"Git push failed: {push_result.output.strip()}",
-                "pr_url": None,
-                **receipt,
-            }
 
         base_branch = asyncio.run(
             get_github_default_branch(repo_owner, repo_name, installation_token)
@@ -266,18 +294,13 @@ def commit_and_open_pr(
         )
 
         if not pr_url:
-            receipt = build_writeback_receipt(
-                branch_name=target_branch,
+            return _build_failure_response(
+                error="Failed to create GitHub PR",
                 status="pr_create_failed",
+                branch_name=target_branch,
                 task_summary=task_summary,
+                pr_existing=False,
             )
-            return {
-                "success": False,
-                "error": "Failed to create GitHub PR",
-                "pr_url": None,
-                "pr_existing": False,
-                **receipt,
-            }
 
         receipt = build_writeback_receipt(
             branch_name=target_branch,
@@ -295,4 +318,9 @@ def commit_and_open_pr(
         }
     except Exception as e:
         logger.exception("commit_and_open_pr failed")
-        return {"success": False, "error": f"{type(e).__name__}: {e}", "pr_url": None}
+        return _build_failure_response(
+            error=f"{type(e).__name__}: {e}",
+            status="writeback_exception",
+            branch_name=target_branch,
+            task_summary=task_summary,
+        )

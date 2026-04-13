@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 from agent import webapp
 from agent.jarvis_bridge.context_transport import (
@@ -9,6 +10,7 @@ from agent.jarvis_bridge.context_transport import (
     extract_controller_payload_from_messages,
 )
 from agent.middleware.check_message_queue import _build_blocks_from_payload
+from agent.middleware.open_pr import open_pr_if_needed
 
 
 def test_build_run_create_payload_preserves_controller_first_mapping() -> None:
@@ -22,6 +24,8 @@ def test_build_run_create_payload_preserves_controller_first_mapping() -> None:
                 "latest_repair_bundle": {"path": "reports/repair.json"},
             }
         },
+        "escalation_semantics": {"verdict": "repairable"},
+        "rule_attachment_summary": {"rule_attachments_loaded": ["AGENTS.md"]},
         "task_summary": {"summary": "controller handoff"},
     }
     payload = build_run_create_payload(
@@ -98,6 +102,87 @@ def test_extract_controller_payload_from_custom_blocks() -> None:
     extracted = extract_controller_payload_from_messages([build_controller_message(payload)])
 
     assert extracted == payload
+
+
+def test_open_pr_middleware_returns_canonical_receipt_when_installation_token_missing(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "agent.middleware.open_pr.get_config",
+        lambda: {
+            "configurable": {
+                "thread_id": "thread-123",
+                "repo": {"owner": "langchain-ai", "name": "open-swe"},
+            },
+            "metadata": {"branch_name": "feature/jarvis-sync"},
+        },
+    )
+    monkeypatch.setattr("agent.middleware.open_pr.get_github_token", lambda: "token")
+    monkeypatch.setattr(
+        "agent.middleware.open_pr.resolve_triggering_user_identity",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "agent.middleware.open_pr.add_pr_collaboration_note",
+        lambda body, _identity: body,
+    )
+    monkeypatch.setattr(
+        "agent.middleware.open_pr.add_user_coauthor_trailer",
+        lambda message, _identity: message,
+    )
+
+    async def fake_get_installation_token() -> None:
+        return None
+
+    monkeypatch.setattr(
+        "agent.middleware.open_pr.get_github_app_installation_token",
+        fake_get_installation_token,
+    )
+
+    result = asyncio.run(
+        open_pr_if_needed.aafter_agent(
+            state={
+                "messages": [
+                    build_controller_message(
+                        {
+                            "task_summary": {"summary": "preserve controller handoff"},
+                            "run_artifacts": {
+                                "latest_slots": {
+                                    "latest_handoff": {"path": "reports/handoff.json"},
+                                    "latest_repair_bundle": {"path": "reports/repair.json"},
+                                }
+                            },
+                        }
+                    ),
+                    {
+                        "name": "commit_and_open_pr",
+                        "content": {
+                            "title": "feat: preserve receipts [closes OPS-1]",
+                            "body": "## Description\nKeep canonical continuity.\n\n## Test Plan\n- [ ] Verify degraded writeback blocks cleanly",
+                            "commit_message": "preserve continuity on failure",
+                        },
+                    },
+                ]
+            },
+            runtime=SimpleNamespace(),
+        )
+    )
+
+    assert result == {
+        "run_artifacts": {
+            "latest_slots": {
+                "latest_handoff": {
+                    "status": "missing_installation_token",
+                    "branch_name": "feature/jarvis-sync",
+                },
+                "latest_repair_bundle": {
+                    "status": "missing_installation_token",
+                    "branch_name": "feature/jarvis-sync",
+                },
+            }
+        },
+        "task_summary": {"summary": "preserve controller handoff"},
+    }
 
 
 def test_process_controller_invocation_uses_real_run_path(monkeypatch) -> None:

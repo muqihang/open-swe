@@ -51,6 +51,19 @@ from ..utils.sandbox_state import get_sandbox_backend
 logger = logging.getLogger(__name__)
 
 
+def _build_failure_receipt(
+    *,
+    status: str,
+    branch_name: str,
+    task_summary: Any | None = None,
+) -> dict[str, Any]:
+    return build_writeback_receipt(
+        branch_name=branch_name,
+        status=status,
+        task_summary=task_summary,
+    )
+
+
 def _extract_pr_params_from_messages(messages: list) -> dict[str, Any] | None:
     """Extract commit_and_open_pr tool result payload."""
     for msg in reversed(messages):
@@ -87,6 +100,11 @@ async def open_pr_if_needed(
 
         messages = state.get("messages", [])
         controller_payload = extract_controller_payload_from_messages(messages)
+        metadata = config.get("metadata", {})
+        target_branch = metadata.get("branch_name") or (
+            f"open-swe/{thread_id}" if thread_id else "open-swe/unknown"
+        )
+        task_summary = resolve_task_summary(controller_payload, configurable)
         verification_bundle = resolve_verification_bundle(
             controller_payload=controller_payload,
             configurable=configurable,
@@ -114,18 +132,36 @@ async def open_pr_if_needed(
         installation_token = await get_github_app_installation_token()
         if not installation_token:
             logger.error("Failed to get GitHub App installation token for thread %s", thread_id)
-            return None
+            return _build_failure_receipt(
+                status="missing_installation_token",
+                branch_name=target_branch,
+                task_summary=task_summary,
+            )
 
         if not thread_id:
-            raise ValueError("No thread_id found in config")
+            return _build_failure_receipt(
+                status="missing_thread_id",
+                branch_name=target_branch,
+                task_summary=task_summary,
+            )
 
         repo_config = configurable.get("repo", {})
         repo_owner = repo_config.get("owner")
         repo_name = repo_config.get("name")
+        if not repo_owner or not repo_name:
+            return _build_failure_receipt(
+                status="missing_repo_config",
+                branch_name=target_branch,
+                task_summary=task_summary,
+            )
 
         sandbox_backend = await get_sandbox_backend(thread_id)
-        if not sandbox_backend or not repo_name:
-            return None
+        if not sandbox_backend:
+            return _build_failure_receipt(
+                status="missing_sandbox",
+                branch_name=target_branch,
+                task_summary=task_summary,
+            )
         repo_dir = await aresolve_repo_dir(sandbox_backend, repo_name)
 
         has_uncommitted_changes = await asyncio.to_thread(
@@ -141,22 +177,25 @@ async def open_pr_if_needed(
 
         if not has_changes:
             logger.info("No changes detected, skipping PR creation")
-            return None
+            return _build_failure_receipt(
+                status="no_changes_detected",
+                branch_name=target_branch,
+                task_summary=task_summary,
+            )
 
-        metadata = config.get("metadata", {})
         if writeback_blocked_by_verification(verification_bundle):
             logger.info("Skipping PR creation because verification state blocks writeback")
-            return build_writeback_receipt(
-                branch_name=metadata.get("branch_name") or f"open-swe/{thread_id}",
+            return _build_failure_receipt(
                 status="blocked_by_verification",
-                task_summary=resolve_task_summary(controller_payload, configurable),
+                branch_name=target_branch,
+                task_summary=task_summary,
             )
 
         logger.info("Changes detected, preparing PR for thread %s", thread_id)
 
         branch_name = metadata.get("branch_name")
         current_branch = await asyncio.to_thread(git_current_branch, sandbox_backend, repo_dir)
-        target_branch = branch_name if branch_name else f"open-swe/{thread_id}"
+        target_branch = branch_name if branch_name else target_branch
 
         if current_branch != target_branch:
             if branch_name:
@@ -200,9 +239,13 @@ async def open_pr_if_needed(
             status="pr_created",
             pr_url=pr_url,
             pr_existing=pr_existing,
-            task_summary=resolve_task_summary(controller_payload, configurable),
+            task_summary=task_summary,
         )
 
     except Exception:
         logger.exception("Error in after-agent middleware")
-    return None
+    return _build_failure_receipt(
+        status="writeback_exception",
+        branch_name=target_branch if "target_branch" in locals() else "open-swe/unknown",
+        task_summary=task_summary if "task_summary" in locals() else None,
+    )
