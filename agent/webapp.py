@@ -14,6 +14,7 @@ from langchain_core.messages.content import create_text_block
 from langgraph_sdk import get_client
 from langgraph_sdk.client import LangGraphClient
 
+from .jarvis_bridge import context_transport
 from .utils.auth import (
     is_bot_token_only_mode,
     persist_encrypted_github_token,
@@ -75,6 +76,7 @@ _AGENT_VERSION_METADATA: dict[str, str] = (
     if os.environ.get("LANGCHAIN_REVISION_ID")
     else {}
 )
+
 
 ALLOWED_GITHUB_ORGS: frozenset[str] = frozenset(
     org.strip().lower()
@@ -460,6 +462,94 @@ async def queue_message_for_thread(
         return False
 
 
+async def _create_agent_run(
+    *,
+    thread_id: str,
+    message_content: str | list[dict[str, Any]],
+    configurable: dict[str, Any],
+    metadata: dict[str, Any] | None = None,
+    branch_name: str | None = None,
+    multitask_strategy: str | None = None,
+    controller_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create a run with canonical controller-first mapping."""
+    langgraph_client = get_client(url=LANGGRAPH_URL)
+    effective_configurable = dict(configurable)
+    if controller_payload:
+        verification_bundle = controller_payload.get("verification_bundle")
+        task_summary = controller_payload.get("task_summary")
+        if isinstance(verification_bundle, dict):
+            effective_configurable.setdefault("verification_bundle", verification_bundle)
+        if task_summary is not None:
+            effective_configurable.setdefault("task_summary", task_summary)
+
+    run_payload = context_transport.build_run_create_payload(
+        thread_id=thread_id,
+        message_content=message_content,
+        configurable=effective_configurable,
+        metadata=metadata,
+        branch_name=branch_name,
+        controller_payload=controller_payload,
+        multitask_strategy=multitask_strategy,
+    )
+    return await langgraph_client.runs.create(
+        run_payload["thread_id"],
+        run_payload["assistant_id"],
+        input=run_payload["input"],
+        config=run_payload["config"],
+        if_not_exists=run_payload["if_not_exists"],
+        **(
+            {"multitask_strategy": run_payload["multitask_strategy"]}
+            if "multitask_strategy" in run_payload
+            else {}
+        ),
+    )
+
+
+async def process_controller_invocation(payload: dict[str, Any]) -> dict[str, Any]:
+    """Process a controller-first invocation request."""
+    thread_id = str(payload.get("thread_id", "")).strip()
+    repo = payload.get("repo")
+    if not thread_id or not isinstance(repo, dict):
+        raise ValueError("Controller invocation requires thread_id and repo")
+
+    configurable: dict[str, Any] = {
+        "repo": repo,
+        "source": payload.get("source", "controller"),
+    }
+    for key in ("user_email", "github_login", "github_user_id"):
+        if key in payload:
+            configurable[key] = payload[key]
+    if isinstance(payload.get("linear_issue"), dict):
+        configurable["linear_issue"] = payload["linear_issue"]
+    if isinstance(payload.get("slack_thread"), dict):
+        configurable["slack_thread"] = payload["slack_thread"]
+    if isinstance(payload.get("configurable_overrides"), dict):
+        configurable.update(payload["configurable_overrides"])
+
+    controller_payload = payload.get("controller_payload")
+    message_content = payload.get("message_content", "")
+
+    if await is_thread_active(thread_id):
+        queued_payload: dict[str, Any] = {}
+        if isinstance(message_content, str):
+            queued_payload["text"] = message_content
+        if isinstance(controller_payload, dict):
+            queued_payload["controller_payload"] = controller_payload
+        queued = await queue_message_for_thread(thread_id=thread_id, message_content=queued_payload)
+        return {"status": "queued", "thread_id": thread_id, "queued": queued}
+
+    run = await _create_agent_run(
+        thread_id=thread_id,
+        message_content=message_content,
+        configurable=configurable,
+        metadata=payload.get("metadata"),
+        branch_name=payload.get("branch_name"),
+        controller_payload=controller_payload if isinstance(controller_payload, dict) else None,
+    )
+    return {"status": "started", "thread_id": thread_id, "run_id": run.get("run_id")}
+
+
 async def process_linear_issue(  # noqa: PLR0912, PLR0915
     issue_data: dict[str, Any], repo_config: dict[str, str]
 ) -> None:
@@ -670,13 +760,11 @@ async def process_linear_issue(  # noqa: PLR0912, PLR0915
             logger.error("Failed to queue message for thread %s", thread_id)
     else:
         logger.info("Creating LangGraph run for thread %s", thread_id)
-        langgraph_client = get_client(url=LANGGRAPH_URL)
-        run = await langgraph_client.runs.create(
-            thread_id,
-            "agent",
-            input={"messages": [{"role": "user", "content": content_blocks}]},
-            config={"configurable": configurable, "metadata": _AGENT_VERSION_METADATA},
-            if_not_exists="create",
+        run = await _create_agent_run(
+            thread_id=thread_id,
+            message_content=content_blocks,
+            configurable=configurable,
+            metadata=_AGENT_VERSION_METADATA,
         )
         logger.info("LangGraph run created successfully for thread %s", thread_id)
         await post_linear_trace_comment(issue_id, run["run_id"], triggering_comment_id)
@@ -824,12 +912,11 @@ async def process_slack_mention(event_data: dict[str, Any], repo_config: dict[st
             logger.error("Failed to queue Slack message for thread %s", thread_id)
         return
 
-    run = await langgraph_client.runs.create(
-        thread_id,
-        "agent",
-        input={"messages": [{"role": "user", "content": content_blocks}]},
-        config={"configurable": configurable, "metadata": _AGENT_VERSION_METADATA},
-        if_not_exists="create",
+    run = await _create_agent_run(
+        thread_id=thread_id,
+        message_content=content_blocks,
+        configurable=configurable,
+        metadata=_AGENT_VERSION_METADATA,
         multitask_strategy="interrupt",
     )
     await post_slack_trace_reply(channel_id, thread_ts, run["run_id"])
@@ -1171,6 +1258,7 @@ async def _trigger_or_queue_run(
     github_user_id: int | None,
     repo_config: dict[str, str],
     pr_number: int,
+    branch_name: str | None = None,
 ) -> None:
     """Create a new agent run or queue the message if the thread is busy."""
     thread_active = await is_thread_active(thread_id)
@@ -1180,22 +1268,18 @@ async def _trigger_or_queue_run(
         return
 
     logger.info("Creating LangGraph run for thread %s from GitHub PR comment", thread_id)
-    langgraph_client = get_client(url=LANGGRAPH_URL)
-    await langgraph_client.runs.create(
-        thread_id,
-        "agent",
-        input={"messages": [{"role": "user", "content": prompt}]},
-        config={
-            "configurable": {
-                "source": "github",
-                "github_login": github_login,
-                "github_user_id": github_user_id,
-                "repo": repo_config,
-                "pr_number": pr_number,
-            },
-            "metadata": _AGENT_VERSION_METADATA,
+    await _create_agent_run(
+        thread_id=thread_id,
+        message_content=prompt,
+        configurable={
+            "source": "github",
+            "github_login": github_login,
+            "github_user_id": github_user_id,
+            "repo": repo_config,
+            "pr_number": pr_number,
         },
-        if_not_exists="create",
+        metadata=_AGENT_VERSION_METADATA,
+        branch_name=branch_name,
     )
     logger.info("LangGraph run created for thread %s from GitHub PR comment", thread_id)
 
@@ -1325,6 +1409,7 @@ async def process_github_pr_comment(payload: dict[str, Any], event_type: str) ->
         github_user_id=github_user_id,
         repo_config=repo_config,
         pr_number=pr_number,
+        branch_name=branch_name,
     )
 
 
@@ -1436,13 +1521,11 @@ async def process_github_issue(payload: dict[str, Any], event_type: str) -> None
         return
 
     logger.info("Creating LangGraph run for thread %s from GitHub issue", thread_id)
-    langgraph_client = get_client(url=LANGGRAPH_URL)
-    await langgraph_client.runs.create(
-        thread_id,
-        "agent",
-        input={"messages": [{"role": "user", "content": prompt}]},
-        config={"configurable": configurable, "metadata": _AGENT_VERSION_METADATA},
-        if_not_exists="create",
+    await _create_agent_run(
+        thread_id=thread_id,
+        message_content=prompt,
+        configurable=configurable,
+        metadata=_AGENT_VERSION_METADATA,
     )
     logger.info("LangGraph run created for thread %s from GitHub issue", thread_id)
 
@@ -1526,3 +1609,9 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks) ->
 
     logger.info("Ignoring unsupported GitHub payload shape for event=%s", event_type)
     return {"status": "ignored", "reason": f"Unsupported payload for event type: {event_type}"}
+
+
+@app.post("/internal/controller/run")
+async def controller_run(request: Request) -> dict[str, Any]:
+    """Handle controller-first invocations."""
+    return await process_controller_invocation(await request.json())

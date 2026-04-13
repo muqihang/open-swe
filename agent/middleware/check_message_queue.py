@@ -15,6 +15,8 @@ from langchain.agents.middleware import AgentState, before_model
 from langgraph.config import get_config, get_store
 from langgraph.runtime import Runtime
 
+from ..jarvis_bridge import context_transport
+from ..jarvis_bridge.context_transport import build_controller_text_block
 from ..utils.multimodal import fetch_image_block
 
 logger = logging.getLogger(__name__)
@@ -31,9 +33,12 @@ async def _build_blocks_from_payload(
 ) -> list[dict[str, Any]]:
     text = payload.get("text", "")
     image_urls = payload.get("image_urls", []) or []
+    controller_payload = payload.get("controller_payload") or payload.get("jarvis_context")
     blocks: list[dict[str, Any]] = []
     if text:
         blocks.append({"type": "text", "text": text})
+    if isinstance(controller_payload, dict):
+        blocks.append(build_controller_text_block(controller_payload))
 
     if not image_urls:
         return blocks
@@ -110,6 +115,15 @@ async def check_message_queue_before_model(  # noqa: PLR0911
                 blocks = await _build_blocks_from_payload(content)
                 content_blocks.extend(blocks)
                 continue
+            if isinstance(content, dict):
+                controller_blocks = context_transport.extract_controller_blocks(content)
+                if controller_blocks:
+                    logger.debug(
+                        "Queued message contains Jarvis controller payload (%d block(s))",
+                        len(controller_blocks),
+                    )
+                    content_blocks.extend(controller_blocks)
+                    continue
             if isinstance(content, list):
                 logger.debug("Queued message contains %d content block(s)", len(content))
                 content_blocks.extend(content)

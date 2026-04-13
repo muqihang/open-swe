@@ -16,6 +16,12 @@ from langchain.agents.middleware import AgentState, after_agent
 from langgraph.config import get_config
 from langgraph.runtime import Runtime
 
+from ..jarvis_bridge.context_transport import extract_controller_payload_from_messages
+from ..jarvis_bridge.receipts import build_writeback_receipt, resolve_task_summary
+from ..jarvis_bridge.verification import (
+    resolve_verification_bundle,
+    writeback_blocked_by_verification,
+)
 from ..utils.authorship import (
     OPEN_SWE_BOT_EMAIL,
     OPEN_SWE_BOT_NAME,
@@ -80,6 +86,11 @@ async def open_pr_if_needed(
         logger.debug("Middleware running for thread %s", thread_id)
 
         messages = state.get("messages", [])
+        controller_payload = extract_controller_payload_from_messages(messages)
+        verification_bundle = resolve_verification_bundle(
+            controller_payload=controller_payload,
+            configurable=configurable,
+        )
         pr_payload = _extract_pr_params_from_messages(messages)
 
         if not pr_payload:
@@ -132,9 +143,17 @@ async def open_pr_if_needed(
             logger.info("No changes detected, skipping PR creation")
             return None
 
+        metadata = config.get("metadata", {})
+        if writeback_blocked_by_verification(verification_bundle):
+            logger.info("Skipping PR creation because verification state blocks writeback")
+            return build_writeback_receipt(
+                branch_name=metadata.get("branch_name") or f"open-swe/{thread_id}",
+                status="blocked_by_verification",
+                task_summary=resolve_task_summary(controller_payload, configurable),
+            )
+
         logger.info("Changes detected, preparing PR for thread %s", thread_id)
 
-        metadata = config.get("metadata", {})
         branch_name = metadata.get("branch_name")
         current_branch = await asyncio.to_thread(git_current_branch, sandbox_backend, repo_dir)
         target_branch = branch_name if branch_name else f"open-swe/{thread_id}"
@@ -165,7 +184,7 @@ async def open_pr_if_needed(
         base_branch = await get_github_default_branch(repo_owner, repo_name, installation_token)
         logger.info("Using base branch: %s", base_branch)
 
-        await create_github_pr(
+        pr_url, _pr_number, pr_existing = await create_github_pr(
             repo_owner=repo_owner,
             repo_name=repo_name,
             github_token=installation_token,
@@ -176,6 +195,13 @@ async def open_pr_if_needed(
         )
 
         logger.info("After-agent middleware completed successfully")
+        return build_writeback_receipt(
+            branch_name=target_branch,
+            status="pr_created",
+            pr_url=pr_url,
+            pr_existing=pr_existing,
+            task_summary=resolve_task_summary(controller_payload, configurable),
+        )
 
     except Exception:
         logger.exception("Error in after-agent middleware")

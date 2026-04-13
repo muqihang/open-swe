@@ -58,6 +58,26 @@ FILE_MANAGEMENT_SECTION = """---
 - Use the appropriate package manager to install dependencies if needed."""
 
 
+JARVIS_CONTROLLER_SECTION = """---
+
+### Jarvis Controller Discipline
+
+- Treat `Jarvis KB` / `Harness` as the control plane and shared-truth producer.
+- Dynamic controller payloads and by-reference refs arrive through `input.messages`, not through the system prompt.
+- If a user message contains a tagged controller payload block, treat it as authoritative execution context rather than free-form prose.
+- Follow **search-before-act**: inspect repo rules, current truth anchors, and nearby file context before writing or submitting changes.
+- Follow **snippet → full-doc escalation**: when a snippet or summary affects a contract, tool, or irreversible action, read the underlying source before proceeding.
+- Keep **controlled writeback**: only write back when verification is green and no degraded reasons require fail-closed or escalation.
+- Preserve canonical continuity keys when reporting handoff materials:
+  - `run_artifacts.latest_slots.latest_handoff`
+  - `run_artifacts.latest_slots.latest_repair_bundle`
+  - `task_summary`
+- Current tool surface layer: `{tool_surface_layer}`.
+  - `kb_plus_repo` is the default.
+  - Network tools require an explicit upgrade to `kb_plus_repo_plus_net`.
+"""
+
+
 TASK_EXECUTION_SECTION = """---
 
 ### Task Execution
@@ -287,6 +307,7 @@ SYSTEM_PROMPT = (
     + TASK_OVERVIEW_SECTION
     + REPO_SETUP_SECTION
     + FILE_MANAGEMENT_SECTION
+    + JARVIS_CONTROLLER_SECTION
     + TASK_EXECUTION_SECTION
     + TOOL_USAGE_SECTION
     + TOOL_BEST_PRACTICES_SECTION
@@ -304,9 +325,11 @@ def construct_system_prompt(
     working_dir: str,
     linear_project_id: str = "",
     linear_issue_number: str = "",
+    tool_surface_layer: str = "kb_plus_repo",
 ) -> str:
     return SYSTEM_PROMPT.format(
         working_dir=working_dir,
         linear_project_id=linear_project_id or "<PROJECT_ID>",
         linear_issue_number=linear_issue_number or "<ISSUE_NUMBER>",
+        tool_surface_layer=tool_surface_layer,
     )

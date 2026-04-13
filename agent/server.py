@@ -26,6 +26,7 @@ from deepagents.backends.protocol import SandboxBackendProtocol
 from langsmith.sandbox import SandboxClientError
 
 from .integrations.langsmith import _configure_github_proxy
+from .jarvis_bridge.contracts import UPGRADED_TOOL_SURFACE_LAYER, resolve_tool_surface_layer
 from .middleware import (
     ToolErrorMiddleware,
     check_message_queue_before_model,
@@ -60,7 +61,7 @@ from .tools import (
 from .utils.auth import resolve_github_token
 from .utils.github_app import get_github_app_installation_token
 from .utils.model import make_model
-from .utils.sandbox import create_sandbox
+from .utils.sandbox import create_sandbox, get_sandbox_type
 from .utils.sandbox_paths import aresolve_sandbox_work_dir
 
 client = get_client()
@@ -80,7 +81,7 @@ async def _create_sandbox_with_proxy() -> SandboxBackendProtocol:
     """
     sandbox_backend = await asyncio.to_thread(create_sandbox)
 
-    sandbox_type = os.getenv("SANDBOX_TYPE", "langsmith")
+    sandbox_type = get_sandbox_type()
     if sandbox_type == "langsmith":
         installation_token = await get_github_app_installation_token()
         if not installation_token:
@@ -96,7 +97,7 @@ async def _refresh_github_proxy(
     sandbox_backend: SandboxBackendProtocol,
 ) -> None:
     """Refresh GitHub proxy credentials for reused LangSmith sandboxes."""
-    if os.getenv("SANDBOX_TYPE", "langsmith") != "langsmith":
+    if get_sandbox_type() != "langsmith":
         return
 
     installation_token = await get_github_app_installation_token()
@@ -187,6 +188,52 @@ DEFAULT_LLM_MODEL_ID = "anthropic:claude-opus-4-6"
 DEFAULT_RECURSION_LIMIT = 1_000
 
 
+def _build_tools(config: RunnableConfig) -> list:
+    """Build the toolset for the current runtime profile."""
+    configurable = config.get("configurable", {})
+    source = configurable.get("source", "controller")
+    tool_surface_layer = resolve_tool_surface_layer(configurable)
+
+    tools = [
+        list_repos,
+        get_branch_name,
+        commit_and_open_pr,
+    ]
+
+    if tool_surface_layer == UPGRADED_TOOL_SURFACE_LAYER:
+        tools.extend([http_request, fetch_url, web_search])
+
+    if source == "linear":
+        tools.extend(
+            [
+                linear_comment,
+                linear_create_issue,
+                linear_delete_issue,
+                linear_get_issue,
+                linear_get_issue_comments,
+                linear_list_teams,
+                linear_update_issue,
+            ]
+        )
+    elif source == "slack":
+        tools.append(slack_thread_reply)
+    elif source == "github":
+        tools.extend(
+            [
+                github_comment,
+                list_pr_reviews,
+                get_pr_review,
+                create_pr_review,
+                update_pr_review,
+                dismiss_pr_review,
+                submit_pr_review,
+                list_pr_review_comments,
+            ]
+        )
+
+    return tools
+
+
 async def get_agent(config: RunnableConfig) -> Pregel:
     """Get or create an agent with a sandbox for the given thread."""
     thread_id = config["configurable"].get("thread_id", None)
@@ -270,6 +317,7 @@ async def get_agent(config: RunnableConfig) -> Pregel:
     linear_issue = config["configurable"].get("linear_issue", {})
     linear_project_id = linear_issue.get("linear_project_id", "")
     linear_issue_number = linear_issue.get("linear_issue_number", "")
+    tool_surface_layer = resolve_tool_surface_layer(config["configurable"])
 
     work_dir = await aresolve_sandbox_work_dir(sandbox_backend)
 
@@ -284,31 +332,9 @@ async def get_agent(config: RunnableConfig) -> Pregel:
             working_dir=work_dir,
             linear_project_id=linear_project_id,
             linear_issue_number=linear_issue_number,
+            tool_surface_layer=tool_surface_layer,
         ),
-        tools=[
-            http_request,
-            fetch_url,
-            web_search,
-            list_repos,
-            get_branch_name,
-            commit_and_open_pr,
-            linear_comment,
-            linear_create_issue,
-            linear_delete_issue,
-            linear_get_issue,
-            linear_get_issue_comments,
-            linear_list_teams,
-            linear_update_issue,
-            slack_thread_reply,
-            github_comment,
-            list_pr_reviews,
-            get_pr_review,
-            create_pr_review,
-            update_pr_review,
-            dismiss_pr_review,
-            submit_pr_review,
-            list_pr_review_comments,
-        ],
+        tools=_build_tools(config),
         backend=sandbox_backend,
         middleware=[
             ToolErrorMiddleware(),

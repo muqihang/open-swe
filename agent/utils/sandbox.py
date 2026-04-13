@@ -14,6 +14,13 @@ SANDBOX_FACTORIES = {
     "local": create_local_sandbox,
 }
 
+DEFAULT_SANDBOX_TYPE = "langsmith"
+
+
+def get_sandbox_type() -> str:
+    """Return the configured sandbox type."""
+    return os.getenv("SANDBOX_TYPE", DEFAULT_SANDBOX_TYPE)
+
 
 def create_sandbox(sandbox_id: str | None = None):
     """Create or reconnect to a sandbox using the configured provider.
@@ -27,7 +34,7 @@ def create_sandbox(sandbox_id: str | None = None):
     Returns:
         A sandbox backend implementing SandboxBackendProtocol.
     """
-    sandbox_type = os.getenv("SANDBOX_TYPE", "langsmith")
+    sandbox_type = get_sandbox_type()
     factory = SANDBOX_FACTORIES.get(sandbox_type)
     if not factory:
         supported = ", ".join(sorted(SANDBOX_FACTORIES))
